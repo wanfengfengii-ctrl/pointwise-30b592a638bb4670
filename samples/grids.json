@@ -1,0 +1,6 @@
+{
+  "asymmetric": {"vertices": [[11, 0], [0, 3]], "threshold": "5/2"},
+  "four_arm": {"vertices": [[1, 0], [0, 1]], "threshold": "1/2"},
+  "peak": {"vertices": [[0, 0, 0], [0, 1, 0], [0, 0, 0]], "threshold": "1/2"},
+  "rescan": {"vertices": [[0, 0, 0], [0, 0, 0], [0, 0, 0]], "threshold": "1/2"}
+}
