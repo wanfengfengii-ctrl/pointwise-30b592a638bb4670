@@ -3,14 +3,25 @@ import json
 from collections import defaultdict
 from dataclasses import dataclass
 
+from freeze.cell_topology import classify_cell
 from freeze.edge_crossings import crossing_from_record, crossing_to_record, grid_edge
-from freeze.evidence import EDGE_ORDER, CellSection, ContourEvidence, section_sort_key
+from freeze.evidence import (
+    EDGE_ORDER,
+    CellSection,
+    ContourEvidence,
+    HotspotEvidence,
+    section_sort_key,
+)
 
 
 @dataclass(frozen=True)
 class ArtifactPayload:
     artifact_id: str
     evidence: ContourEvidence
+
+
+_V1_BODY_KEYS = {'version', 'artifact_id', 'revision_id', 'threshold2', 'rows', 'cols', 'sections'}
+_V2_BODY_KEYS = _V1_BODY_KEYS | {'batch_id', 'vertices'}
 
 
 def canonical_json(value: object) -> bytes:
@@ -21,8 +32,9 @@ def canonical_json(value: object) -> bytes:
 
 def encode_artifact(payload: ArtifactPayload) -> bytes:
     evidence = payload.evidence
+    hotspot = isinstance(evidence, HotspotEvidence)
     body = {
-        'version': 1,
+        'version': 2 if hotspot else 1,
         'artifact_id': payload.artifact_id,
         'revision_id': evidence.revision_id,
         'threshold2': evidence.threshold2,
@@ -36,6 +48,9 @@ def encode_artifact(payload: ArtifactPayload) -> bytes:
             for section in evidence.sections
         ],
     }
+    if hotspot:
+        body['batch_id'] = evidence.batch_id
+        body['vertices'] = [list(row) for row in evidence.vertices]
     return canonical_json({'body': body, 'sha256': hashlib.sha256(canonical_json(body)).hexdigest()})
 
 
@@ -85,6 +100,54 @@ def _read_sections(entries: object, rows: int, cols: int) -> tuple[CellSection, 
     return sections
 
 
+def _read_common_body(body: dict) -> tuple:
+    artifact_id, revision_id = body['artifact_id'], body['revision_id']
+    if any(not isinstance(value, str) or not value for value in (artifact_id, revision_id)):
+        raise ValueError('invalid artifact identity')
+    rows, cols = body['rows'], body['cols']
+    if any(type(value) is not int or value < 1 for value in (rows, cols)):
+        raise ValueError('invalid artifact dimensions')
+    threshold2 = body['threshold2']
+    if type(threshold2) is not int or threshold2 % 2 != 1:
+        raise ValueError('invalid artifact threshold')
+    sections = _read_sections(body['sections'], rows, cols)
+    return artifact_id, revision_id, rows, cols, threshold2, sections
+
+
+def _read_vertices(raw: object, rows: int, cols: int) -> tuple[tuple[int, ...], ...]:
+    if not isinstance(raw, list) or len(raw) != rows + 1:
+        raise ValueError('invalid hotspot evidence grid')
+    vertices = []
+    for entry in raw:
+        if not isinstance(entry, list) or len(entry) != cols + 1:
+            raise ValueError('invalid hotspot evidence grid')
+        if any(type(temperature) is not int for temperature in entry):
+            raise ValueError('hotspot evidence temperatures must be integers')
+        vertices.append(tuple(entry))
+    return tuple(vertices)
+
+
+def _check_hotspot_consistency(
+    vertices: tuple[tuple[int, ...], ...],
+    threshold2: int,
+    rows: int,
+    cols: int,
+    sections: tuple[CellSection, ...],
+) -> None:
+    expected = []
+    for row in range(rows):
+        for col in range(cols):
+            corners = (
+                vertices[row][col],
+                vertices[row][col + 1],
+                vertices[row + 1][col],
+                vertices[row + 1][col + 1],
+            )
+            expected.extend(classify_cell(row, col, corners, threshold2))
+    if tuple(expected) != sections:
+        raise ValueError('hotspot evidence contradicts the contour sections')
+
+
 def decode_artifact(carrier: bytes) -> ArtifactPayload:
     if not isinstance(carrier, bytes):
         raise ValueError('artifact must be bytes')
@@ -100,22 +163,31 @@ def decode_artifact(carrier: bytes) -> ArtifactPayload:
     body = envelope['body']
     if hashlib.sha256(canonical_json(body)).hexdigest() != envelope['sha256']:
         raise ValueError('artifact checksum mismatch')
-    if not isinstance(body, dict) or body.keys() != {
-        'version', 'artifact_id', 'revision_id', 'threshold2', 'rows', 'cols', 'sections'
-    }:
+    if not isinstance(body, dict):
         raise ValueError('invalid artifact body')
-    if type(body['version']) is not int or body['version'] != 1:
+    version = body.get('version')
+    if type(version) is not int or version not in (1, 2):
         raise ValueError('unsupported artifact version')
+    if body.keys() != (_V1_BODY_KEYS if version == 1 else _V2_BODY_KEYS):
+        raise ValueError('invalid artifact body')
 
-    artifact_id, revision_id = body['artifact_id'], body['revision_id']
-    if any(not isinstance(value, str) or not value for value in (artifact_id, revision_id)):
-        raise ValueError('invalid artifact identity')
-    rows, cols = body['rows'], body['cols']
-    if any(type(value) is not int or value < 1 for value in (rows, cols)):
-        raise ValueError('invalid artifact dimensions')
-    threshold2 = body['threshold2']
-    if type(threshold2) is not int or threshold2 % 2 != 1:
-        raise ValueError('invalid artifact threshold')
+    artifact_id, revision_id, rows, cols, threshold2, sections = _read_common_body(body)
+    if version == 1:
+        evidence = ContourEvidence(revision_id, threshold2, rows, cols, sections)
+        return ArtifactPayload(artifact_id, evidence)
 
-    sections = _read_sections(body['sections'], rows, cols)
-    return ArtifactPayload(artifact_id, ContourEvidence(revision_id, threshold2, rows, cols, sections))
+    batch_id = body['batch_id']
+    if not isinstance(batch_id, str) or not batch_id:
+        raise ValueError('invalid artifact batch')
+    vertices = _read_vertices(body['vertices'], rows, cols)
+    _check_hotspot_consistency(vertices, threshold2, rows, cols, sections)
+    evidence = HotspotEvidence(
+        revision_id=revision_id,
+        threshold2=threshold2,
+        rows=rows,
+        cols=cols,
+        sections=sections,
+        batch_id=batch_id,
+        vertices=vertices,
+    )
+    return ArtifactPayload(artifact_id, evidence)

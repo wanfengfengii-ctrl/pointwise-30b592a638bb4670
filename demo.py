@@ -4,9 +4,10 @@ from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from archive.codec import decode_artifact
 from archive.pickup import pickup_artifact
 from archive.storage import ArchiveStore
-from freeze.assemble import freeze_contour
+from freeze.assemble import freeze_contour, freeze_hotspots
 from freeze.field_view import inspect_cell
 from handover.history import load_handover
 from handover.register import ack_handover
@@ -14,7 +15,7 @@ from handover.store import HandoverStore
 from intake.revisions import ingest_grid
 from intake.source_state import disable_source
 from intake.store import IntakeStore
-from review.report import audit_contour
+from review.report import audit_contour, compare_hotspots
 
 
 def open_stores(connection):
@@ -111,6 +112,64 @@ def main():
              'new': line_summary(audit_contour(new_carrier))},
             ['intake/source_state.py', 'handover/history.py', 'review/components.py'],
             '旧图四个单元围绕唯一高点连成闭环。新图所有顶点均低于阈值。',
+        )
+
+        scan = samples['hotspot_scan']
+        rescan_hot = samples['hotspot_rescan']
+        with closing(sqlite3.connect(database)) as connection:
+            intake, archive, _ = open_stores(connection)
+            scan_revision = ingest_grid(intake, 'kiln-9', scan['vertices'])
+            scan_artifact = freeze_hotspots(intake, archive, scan_revision, scan['threshold'])
+            rescan_revision = ingest_grid(
+                intake, 'kiln-9', rescan_hot['vertices'], predecessor=scan_revision
+            )
+            disable_source(intake, scan_revision)
+            rescan_artifact = freeze_hotspots(
+                intake, archive, rescan_revision, rescan_hot['threshold']
+            )
+
+        with closing(sqlite3.connect(database)) as connection:
+            intake, archive, _ = open_stores(connection)
+            try:
+                freeze_hotspots(intake, archive, scan_revision, scan['threshold'])
+            except ValueError:
+                source_stopped = True
+            else:
+                source_stopped = False
+            scan_carrier = pickup_artifact(archive, scan_artifact)
+            rescan_carrier = pickup_artifact(archive, rescan_artifact)
+
+        comparison = compare_hotspots(scan_carrier, rescan_carrier)
+        reclaimed = (
+            decode_artifact(scan_carrier).artifact_id == scan_artifact
+            and decode_artifact(rescan_carrier).artifact_id == rescan_artifact
+        )
+        emit(
+            'v5.hotspot_compare',
+            {'batch': 'kiln-9', 'old': scan, 'new': rescan_hot},
+            {'source_stopped': True, 'reclaimed_by_original_id': True},
+            {'source_stopped': source_stopped, 'reclaimed_by_original_id': reclaimed},
+            {
+                'old_regions': [[[0, 0], [0, 1], [0, 2]]],
+                'new_regions': [[[0, 0]], [[0, 2]]],
+                'old_port_regions': [[0, 0], [0, 0]],
+                'new_port_regions': [[0, 0], [1, 1]],
+                'matches': [[0, 0], [0, 1]],
+                'splits': [0], 'merges': [], 'disappeared': [], 'born': [],
+            },
+            {
+                'old_regions': comparison['old']['regions'],
+                'new_regions': comparison['new']['regions'],
+                'old_port_regions': comparison['old']['port_regions'],
+                'new_port_regions': comparison['new']['port_regions'],
+                'matches': comparison['matches'],
+                'splits': comparison['splits'],
+                'merges': comparison['merges'],
+                'disappeared': comparison['disappeared'],
+                'born': comparison['born'],
+            },
+            ['freeze/assemble.py', 'archive/codec.py', 'review/hotspots.py', 'review/report.py'],
+            '旧图三个热顶点连成一区；复扫中点变冷后断为两区。停源重开按原号领取，关库后仅凭两份字节对照。',
         )
 
 

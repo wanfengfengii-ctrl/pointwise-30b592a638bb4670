@@ -4,6 +4,7 @@ from archive.codec import decode_artifact
 from freeze.edge_crossings import crossing_from_record, crossing_to_record
 from freeze.evidence import EDGE_ORDER
 from review.components import WalkComponent, collect_components
+from review.hotspots import compare_hotspots  # noqa: F401  # HOTSPOTS.md 约定的对照入口
 from review.ports import SectionRef, index_ports
 from review.stitch import stitch_sections
 
